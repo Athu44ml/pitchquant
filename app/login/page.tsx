@@ -24,7 +24,7 @@ export default function LoginPage() {
       <div className="w-full max-w-xs space-y-5">
         <div className="flex items-center gap-2">
           <span className="w-2 h-2 bg-[#17A371] rounded-[2px]"></span>
-          <span className="text-[13px] font-semibold tracking-tight text-[#E9EEF3]">Football Analytics</span>
+          <span className="text-[13px] font-semibold tracking-tight text-[#E9EEF3]">PitchQuant</span>
         </div>
 
         <div>

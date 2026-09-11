@@ -1,6 +1,6 @@
 import { Mod, MethodologyNote } from '@/components/ui';
 
-export const metadata = { title: 'Methodology — Football Analytics' };
+export const metadata = { title: 'Methodology — PitchQuant' };
 
 export default function MethodologyPage() {
   return (
