@@ -63,6 +63,7 @@ export default function MatchResearchPage() {
   };
 
   const leagueName = (id: string) => LEAGUES.find((l) => l.id === id)?.name || id;
+  const resultsOnly = homeLab?.oddsBasis === 'RESULTS_ONLY';
 
   return (
     <div className="page">
@@ -110,6 +111,7 @@ export default function MatchResearchPage() {
         <div className="min-w-0">
           {!sel ? <p className="sub">No upcoming fixtures loaded — check public/fixtures.</p> : (
             <>
+              {resultsOnly && <p className="sub mb-3">Historical bookmaker odds unavailable for this market — results only. No profit or odds figures are shown.</p>}
               <Mod first title="TEAM SNAPSHOTS · SELECTED MARKET">
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
                   {[homeLab, awayLab].map((lab, i) => lab && (
@@ -117,12 +119,21 @@ export default function MatchResearchPage() {
                       <p className="text-[12.5px] text-[var(--tx)] font-medium mb-2 flex items-center gap-2">
                         <Crest name={lab.team} size={15} /> {lab.team}
                       </p>
-                      <Metrics items={[
-                        { label: 'Observations', value: String(lab.overview.n) },
-                        { label: 'Wins', value: String(lab.overview.wins) },
-                        { label: 'Avg odds', value: lab.overview.avgOdds.toFixed(2) },
-                        { label: 'Net P/L', value: `${lab.overview.profit >= 0 ? '+' : '−'}$${Math.abs(lab.overview.profit)}`, tone: lab.overview.profit >= 0 ? 'pos' : 'neg' },
-                      ]} />
+                      {lab.oddsBasis === 'BOOKMAKER_ODDS' ? (
+                        <Metrics items={[
+                          { label: 'Observations', value: String(lab.overview.n) },
+                          { label: 'Wins', value: String(lab.overview.wins) },
+                          { label: 'Avg odds', value: lab.overview.avgOdds != null ? lab.overview.avgOdds.toFixed(2) : '—' },
+                          { label: 'Net P/L', value: lab.overview.profit != null ? `${lab.overview.profit >= 0 ? '+' : '−'}$${Math.abs(lab.overview.profit)}` : '—', tone: (lab.overview.profit ?? 0) >= 0 ? 'pos' : 'neg' },
+                        ]} />
+                      ) : (
+                        <Metrics items={[
+                          { label: 'Observations', value: String(lab.overview.n) },
+                          { label: 'Wins', value: String(lab.overview.wins) },
+                          { label: 'Losses', value: String(lab.overview.losses) },
+                          { label: 'Win rate', value: lab.overview.n ? lab.overview.winRate + '%' : '—' },
+                        ]} />
+                      )}
                       <div className="mt-2 flex justify-end"><ConfidenceBadge wins={lab.overview.wins} n={lab.overview.n} /></div>
                     </div>
                   ))}
@@ -140,7 +151,7 @@ export default function MatchResearchPage() {
                       { k: 'evidence', v: `N=${modelQ.confidence?.n} · ${modelQ.confidence?.label}` },
                     ]} />
                     <p className="sub mt-2">
-                      Market odds and bookmaker comparison appear here once ODDS_API_KEY is configured server-side. Until then this module reports the model's own probability and fair odds only.
+                      This module reports the model's own probability and fair odds. Live bookmaker prices for upcoming fixtures are on Find Your Odds (/odds), sourced from the connected provider.
                     </p>
                   </>
                 ) : <p className="sub">model unavailable for this fixture</p>}
