@@ -3,6 +3,7 @@ import "./theme.css";
 import AuthGate from "@/components/AuthGate";
 import TopBar from "@/components/TopBar";
 import SideNav from "@/components/SideNav";
+import { Analytics } from "@vercel/analytics/next";
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
@@ -17,6 +18,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
             </div>
           </div>
         </AuthGate>
+        <Analytics />
       </body>
     </html>
   );
