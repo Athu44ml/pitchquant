@@ -63,3 +63,15 @@ export interface CaptureLog {
   fixtures_seen: number; snapshots_written: number; error_code: string | null;
   error_message: string | null; created_at: string;
 }
+// Checkpoint windows (minutes before kickoff + grace in minutes).
+// Window = [ko - mins - grace, ko - mins + grace]; >=12min wide so a
+// 10-minute cron tick always lands inside every window.
+export const CHECKPOINT_WINDOWS: Record<CheckpointStage, { mins: number; grace: number }> = {
+  T_MINUS_12H: { mins: 720, grace: 60 },
+  T_MINUS_6H:  { mins: 360, grace: 40 },
+  T_MINUS_3H:  { mins: 180, grace: 25 },
+  T_MINUS_1H:  { mins: 60,  grace: 12 },
+  T_MINUS_30M: { mins: 30,  grace: 8 },
+  T_MINUS_15M: { mins: 15,  grace: 6 },
+  KICKOFF:     { mins: 0,   grace: 6 },
+};

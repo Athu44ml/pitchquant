@@ -243,4 +243,4 @@ drop policy if exists pq_public_read on odds_snapshots;
 create policy pq_public_read on odds_snapshots for select to anon, authenticated using (true);
 drop policy if exists pq_public_read on match_results;
 create policy pq_public_read on match_results for select to anon, authenticated using (true);
--- identity_review, provider_fixture_map, capture_log: intentionally no policies
+-- identity_review, provider_fixture_map, capture_log: intentionally no policiesgit status
