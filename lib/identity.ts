@@ -1,14 +1,5 @@
 import type { CheckpointStage, Fixture } from '@/lib/db/types';
-
-const CHECKPOINT_WINDOWS: Record<string, { mins: number; grace: number }> = {
-  t_minus_24h: { mins: 24 * 60, grace: 30 },
-  t_minus_6h: { mins: 6 * 60, grace: 30 },
-  t_minus_1h: { mins: 60, grace: 15 },
-  t_minus_15m: { mins: 15, grace: 5 },
-  kickoff: { mins: 0, grace: 5 },
-  half_time: { mins: -45, grace: 10 },
-  full_time: { mins: -105, grace: 15 },
-};
+import { CHECKPOINT_WINDOWS } from '@/lib/db/types';
 
 /**
  * Normalize a team name for identity matching.
@@ -71,24 +62,37 @@ export function buildCheckpoints(
 }
 
 /**
- * Parse a CSV date string (YYYY-MM-DD) as UTC midnight.
- * CSV files don't include timezone info, so we treat them as UTC.
- * This is consistent across all leagues.
+ * Parse football-data CSV dates: YYYY-MM-DD (newer) or DD/MM/YYYY / DD/MM/YY (older).
+ * Returns null on unparseable input — callers must skip, never guess.
  */
-export function parseCsvDate(dateStr: string): string {
-  const d = new Date(dateStr + 'T00:00:00.000Z');
-  return d.toISOString();
+export function parseCsvDate(dateStr: string): string | null {
+  const s = String(dateStr).trim();
+  let iso: string | null = null;
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
+    iso = `${s}T00:00:00.000Z`;
+  } else {
+    const m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
+    if (m) {
+      let [, d, mo, y] = m;
+      if (y.length === 2) y = String(2000 + Number(y)); // SEASONS starts 15/16 => 20xx
+      iso = `${y}-${mo.padStart(2, '0')}-${d.padStart(2, '0')}T00:00:00.000Z`;
+    }
+  }
+  if (!iso) return null;
+  const t = Date.parse(iso);
+  return Number.isNaN(t) ? null : new Date(t).toISOString();
 }
 
 /**
- * Parse a TheSportsDB fixture (date + time) as UTC.
- * TheSportsDB provides date (YYYY-MM-DD) and time (HH:MM:SS) separately.
+ * TheSportsDB date+time -> ISO UTC, or null if unparseable.
  */
-export function parseTheSportsDBDateTime(date: string, time: string): string {
-  const [y, m, d] = date.split('-').map(Number);
-  const [h, min, s] = (time || '00:00:00').split(':').map(Number);
-  const dt = new Date(Date.UTC(y, m - 1, d, h || 0, min || 0, s || 0));
-  return dt.toISOString();
+export function parseTheSportsDBDateTimeSafe(date: unknown, time: unknown): string | null {
+  if (!date) return null;
+  const datePart = String(date).trim();
+  const timePart = time ? String(time).trim() : '00:00:00';
+  const value = `${datePart}T${timePart}${/[zZ]|[+-]\d{2}:?\d{2}$/.test(timePart) ? '' : 'Z'}`;
+  const t = Date.parse(value);
+  return Number.isNaN(t) ? null : new Date(t).toISOString();
 }
 
 /**

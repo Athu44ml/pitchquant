@@ -3,342 +3,189 @@ import path from 'path';
 import Papa from 'papaparse';
 import { LEAGUES, SEASONS } from '@/lib/constants';
 import { getSupabaseAdmin } from '@/lib/supabase';
-import { normalizeTeamName, buildMatchRef, buildCheckpoints, parseCsvDate } from '@/lib/identity';
-import type { TeamCanonical, Fixture, Checkpoint } from '@/lib/db/types';
+import { normalizeTeamName, buildMatchRef, buildCheckpoints, parseCsvDate, parseTheSportsDBDateTimeSafe } from '@/lib/identity';
+import type { TeamCanonical, Fixture } from '@/lib/db/types';
 
-function parseTheSportsDBDateTime(date: unknown, time: unknown): string | null {
-  if (!date) return null;
+const CHUNK = 400;
 
-  const datePart = String(date).trim();
-  const timePart = time ? String(time).trim() : '00:00:00';
-  const value = `${datePart}T${timePart}${/[zZ]|[+-]\d{2}:?\d{2}$/.test(timePart) ? '' : 'Z'}`;
-  const timestamp = Date.parse(value);
-
-  return Number.isNaN(timestamp) ? null : new Date(timestamp).toISOString();
-}
-
-/**
- * Ingest all historical CSV data into Supabase.
- * Parses every {prefix}-{season}.csv file, creates teams + fixtures + checkpoints.
- * Zero provider calls.
- */
-export async function ingestCSVs(): Promise<{
+export type IngestResult = {
   teamsCreated: number;
   fixturesCreated: number;
   checkpointsCreated: number;
   errors: string[];
-}> {
+};
+
+function chunk<T>(rows: T[], size = CHUNK): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < rows.length; i += size) out.push(rows.slice(i, i + size));
+  return out;
+}
+
+/** Chunked upsert; returns inserted rows only; collects errors without aborting. */
+async function upsertChunks(sb: any, table: string, rows: any[], onConflict: string) {
+  const inserted: any[] = [];
+  const errors: string[] = [];
+  for (const c of chunk(rows)) {
+    const { data, error } = await sb.from(table).upsert(c, { onConflict, ignoreDuplicates: true }).select();
+    if (error) errors.push(`${table} upsert: ${error.message}`);
+    else inserted.push(...(data || []));
+  }
+  return { inserted, errors };
+}
+
+/** Full (league, normalized_name) -> team_id map from DB. Never trust upsert return alone. */
+async function loadTeamMap(sb: any, leagueIds: string[]) {
+  const map = new Map<string, string>();
+  const { data, error } = await sb
+    .from('team_canonical')
+    .select('team_id,league_id,normalized_name')
+    .in('league_id', leagueIds);
+  if (error) return { map, error: error.message as string };
+  for (const r of data || []) map.set(`${r.league_id}:${r.normalized_name}`, r.team_id);
+  return { map, error: null };
+}
+
+function readCsv(filename: string): any[] | null {
+  const filepath = path.join(process.cwd(), 'public', filename);
+  if (!fs.existsSync(filepath)) return null;
+  let content = fs.readFileSync(filepath, 'utf-8');
+  if (content.charCodeAt(0) === 0xfeff) content = content.slice(1);
+  const parsed = Papa.parse(content, { header: true, dynamicTyping: true, skipEmptyLines: true });
+  return (parsed.data as any[]).filter((m) => m.HomeTeam && m.AwayTeam);
+}
+
+/**
+ * Historical CSV ingestion: teams + fixtures only.
+ * NO checkpoints here by design — checkpoints are a capture queue for
+ * UPCOMING fixtures; historical matches are already finished.
+ */
+export async function ingestCSVs(leagueFilter?: string): Promise<IngestResult> {
   const sb = getSupabaseAdmin();
   const errors: string[] = [];
-  let teamsCreated = 0;
-  let fixturesCreated = 0;
-  let checkpointsCreated = 0;
+  const scope = LEAGUES.filter((l) => !leagueFilter || l.id === leagueFilter);
+  if (scope.length === 0) return { teamsCreated: 0, fixturesCreated: 0, checkpointsCreated: 0, errors: [`unknown league ${leagueFilter}`] };
 
-  // Pass 1: Extract all unique team names per league, create team_canonical entries
-  const teamMap = new Map<string, string>(); // normalized_name -> team_id
+  // Pass 1: team rows (deduped in-memory)
+  const seen = new Set<string>();
   const teamRows: Omit<TeamCanonical, 'team_id' | 'created_at'>[] = [];
-
-  for (const league of LEAGUES) {
+  for (const league of scope) {
     for (const season of SEASONS) {
-      const filename = `${league.prefix}-${season.id}.csv`;
-      const filepath = path.join(process.cwd(), 'public', filename);
-      if (!fs.existsSync(filepath)) continue;
-
-      try {
-        let content = fs.readFileSync(filepath, 'utf-8');
-        if (content.charCodeAt(0) === 0xFEFF) content = content.slice(1);
-        const parsed = Papa.parse(content, { header: true, dynamicTyping: true, skipEmptyLines: true });
-        const matches = (parsed.data as any[]).filter((m) => m.HomeTeam && m.AwayTeam);
-
-        for (const m of matches) {
-          const homeName = String(m.HomeTeam);
-          const awayName = String(m.AwayTeam);
-          const homeNorm = normalizeTeamName(homeName);
-          const awayNorm = normalizeTeamName(awayName);
-
-          if (!teamMap.has(`${league.id}:${homeNorm}`)) {
-            teamRows.push({
-              league_id: league.id,
-              season: season.id,
-              canonical_name: homeName,
-              normalized_name: homeNorm,
-            });
-            teamMap.set(`${league.id}:${homeNorm}`, homeNorm);
-          }
-          if (!teamMap.has(`${league.id}:${awayNorm}`)) {
-            teamRows.push({
-              league_id: league.id,
-              season: season.id,
-              canonical_name: awayName,
-              normalized_name: awayNorm,
-            });
-            teamMap.set(`${league.id}:${awayNorm}`, awayNorm);
-          }
+      const matches = readCsv(`${league.prefix}-${season.id}.csv`);
+      if (!matches) continue;
+      for (const m of matches) {
+        for (const raw of [String(m.HomeTeam), String(m.AwayTeam)]) {
+          const norm = normalizeTeamName(raw);
+          const key = `${league.id}:${norm}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          teamRows.push({ league_id: league.id, season: season.id, canonical_name: raw, normalized_name: norm });
         }
-      } catch (err: any) {
-        errors.push(`CSV parse error ${filename}: ${err.message}`);
       }
     }
   }
+  const teams = await upsertChunks(sb, 'team_canonical', teamRows, 'league_id,normalized_name');
+  errors.push(...teams.errors);
 
-  // Upsert team_canonical (onConflict: league_id + normalized_name)
-  if (teamRows.length > 0) {
-    const { data, error } = await sb
-      .from('team_canonical')
-      .upsert(teamRows, { onConflict: 'league_id,normalized_name', ignoreDuplicates: true })
-      .select('team_id,league_id,normalized_name');
+  // Full map from DB (fixes re-run / cross-run blindness)
+  const { map: teamMap, error: mapErr } = await loadTeamMap(sb, scope.map((l) => l.id));
+  if (mapErr) return { teamsCreated: teams.inserted.length, fixturesCreated: 0, checkpointsCreated: 0, errors: [...errors, `team map: ${mapErr}`] };
 
-    if (error) {
-      errors.push(`team_canonical upsert: ${error.message}`);
-      return { teamsCreated: 0, fixturesCreated: 0, checkpointsCreated: 0, errors };
-    }
-
-    teamsCreated = data?.length || 0;
-    // Build reverse map: (league_id, normalized_name) -> team_id
-    for (const row of data || []) {
-      teamMap.set(`${row.league_id}:${row.normalized_name}`, row.team_id);
-    }
-  }
-
-  // Pass 2: Create fixtures + checkpoints for every match
+  // Pass 2: fixtures
   const fixtureRows: Omit<Fixture, 'fixture_id' | 'created_at' | 'updated_at'>[] = [];
-
-  for (const league of LEAGUES) {
+  for (const league of scope) {
     for (const season of SEASONS) {
-      const filename = `${league.prefix}-${season.id}.csv`;
-      const filepath = path.join(process.cwd(), 'public', filename);
-      if (!fs.existsSync(filepath)) continue;
-
-      try {
-        let content = fs.readFileSync(filepath, 'utf-8');
-        if (content.charCodeAt(0) === 0xFEFF) content = content.slice(1);
-        const parsed = Papa.parse(content, { header: true, dynamicTyping: true, skipEmptyLines: true });
-        const matches = (parsed.data as any[]).filter((m) => m.HomeTeam && m.AwayTeam && m.Date);
-
-        for (const m of matches) {
-          const homeName = String(m.HomeTeam);
-          const awayName = String(m.AwayTeam);
-          const homeNorm = normalizeTeamName(homeName);
-          const awayNorm = normalizeTeamName(awayName);
-          const homeId = teamMap.get(`${league.id}:${homeNorm}`);
-          const awayId = teamMap.get(`${league.id}:${awayNorm}`);
-
-          if (!homeId || !awayId) {
-            errors.push(`Missing team_id for ${homeName} or ${awayName} in ${filename}`);
-            continue;
-          }
-
-          const matchRef = buildMatchRef(league.id, season.id, homeId, awayId);
-          const kickoffUtc = parseCsvDate(String(m.Date));
-
-          fixtureRows.push({
-            provider: null,
-            provider_fixture_id: null,
-            league_id: league.id,
-            season: season.id,
-            home_team_id: homeId,
-            away_team_id: awayId,
-            match_ref: matchRef,
-            status: 'finished', // CSV data is historical
-            scheduled_kickoff_utc: kickoffUtc,
-            actual_kickoff_utc: null,
-            provider_updated_at: null,
-            source: 'csv',
-          });
-        }
-      } catch (err: any) {
-        errors.push(`Fixture creation error ${filename}: ${err.message}`);
+      const matches = readCsv(`${league.prefix}-${season.id}.csv`);
+      if (!matches) continue;
+      for (const m of matches) {
+        const homeId = teamMap.get(`${league.id}:${normalizeTeamName(String(m.HomeTeam))}`);
+        const awayId = teamMap.get(`${league.id}:${normalizeTeamName(String(m.AwayTeam))}`);
+        if (!homeId || !awayId) { errors.push(`missing team_id in ${league.prefix}-${season.id}.csv: ${m.HomeTeam} v ${m.AwayTeam}`); continue; }
+        if (homeId === awayId) { errors.push(`same team both sides in ${league.prefix}-${season.id}.csv: ${m.HomeTeam}`); continue; }
+        const ko = parseCsvDate(String(m.Date));
+        if (!ko) { errors.push(`bad date in ${league.prefix}-${season.id}.csv: ${m.Date} (${m.HomeTeam} v ${m.AwayTeam})`); continue; }
+        fixtureRows.push({
+          provider: null, provider_fixture_id: null,
+          league_id: league.id, season: season.id,
+          home_team_id: homeId, away_team_id: awayId,
+          match_ref: buildMatchRef(league.id, season.id, homeId, awayId),
+          status: 'finished', scheduled_kickoff_utc: ko,
+          actual_kickoff_utc: null, provider_updated_at: null, source: 'csv',
+        });
       }
     }
   }
+  const fx = await upsertChunks(sb, 'fixtures', fixtureRows, 'match_ref');
+  errors.push(...fx.errors);
 
-  // Upsert fixtures (onConflict: match_ref)
-  if (fixtureRows.length > 0) {
-    const { data, error } = await sb
-      .from('fixtures')
-      .upsert(fixtureRows, { onConflict: 'match_ref', ignoreDuplicates: true })
-      .select('fixture_id,match_ref,scheduled_kickoff_utc');
-
-    if (error) {
-      errors.push(`fixtures upsert: ${error.message}`);
-      return { teamsCreated, fixturesCreated: 0, checkpointsCreated: 0, errors };
-    }
-
-    fixturesCreated = data?.length || 0;
-
-    // Build checkpoints for each fixture
-    const checkpointRows: ReturnType<typeof buildCheckpoints> = [];
-    for (const fx of data || []) {
-      const cps = buildCheckpoints(fx.fixture_id, fx.scheduled_kickoff_utc);
-      checkpointRows.push(...cps);
-    }
-
-    // Upsert checkpoints (onConflict: fixture_id,stage)
-    if (checkpointRows.length > 0) {
-      const { error: cpError } = await sb
-        .from('checkpoints')
-        .upsert(checkpointRows, { onConflict: 'fixture_id,stage', ignoreDuplicates: true });
-
-      if (cpError) {
-        errors.push(`checkpoints upsert: ${cpError.message}`);
-      } else {
-        checkpointsCreated = checkpointRows.length;
-      }
-    }
-  }
-
-  return { teamsCreated, fixturesCreated, checkpointsCreated, errors };
+  return { teamsCreated: teams.inserted.length, fixturesCreated: fx.inserted.length, checkpointsCreated: 0, errors };
 }
 
 /**
- * Ingest live fixtures from TheSportsDB into Supabase.
- * Calls the existing sync-fixtures logic, materializes into Supabase.
- * Zero provider calls.
+ * Live fixture ingestion via existing TheSportsDB sync route (internal call).
+ * Creates teams, fixtures, AND the 7 capture checkpoints per upcoming fixture.
  */
-export async function ingestTheSportsDB(): Promise<{
-  teamsCreated: number;
-  fixturesCreated: number;
-  checkpointsCreated: number;
-  errors: string[];
-}> {
+export async function ingestTheSportsDB(): Promise<IngestResult> {
   const sb = getSupabaseAdmin();
   const errors: string[] = [];
 
-  // Import the sync-fixtures logic dynamically to avoid circular deps
   const { GET } = await import('@/app/api/sync-fixtures/route');
-  const req = new Request('http://localhost/api/sync-fixtures?league=all');
-  const res = await GET(req);
+  const res = await GET(new Request('http://localhost/api/sync-fixtures?league=all'));
   const payload = await res.json();
+  if (payload.errors?.length) errors.push(...payload.errors);
 
-  if (payload.errors && payload.errors.length > 0) {
-    errors.push(...payload.errors);
-  }
+  const leagueIds = LEAGUES.map((l) => l.id);
+  const fixtures: any[] = (payload.fixtures || []).filter((f: any) => leagueIds.includes(f.league));
+  if (fixtures.length === 0) return { teamsCreated: 0, fixturesCreated: 0, checkpointsCreated: 0, errors };
 
-  const fixtures: any[] = payload.fixtures || [];
-  if (fixtures.length === 0) {
-    return { teamsCreated: 0, fixturesCreated: 0, checkpointsCreated: 0, errors };
-  }
-
-  // Extract teams, create team_canonical entries
+  const seen = new Set<string>();
   const teamRows: Omit<TeamCanonical, 'team_id' | 'created_at'>[] = [];
-  const teamMap = new Map<string, string>(); // league:normalized -> team_id
-
   for (const f of fixtures) {
-    const homeNorm = normalizeTeamName(f.home);
-    const awayNorm = normalizeTeamName(f.away);
-    const homeKey = `${f.league}:${homeNorm}`;
-    const awayKey = `${f.league}:${awayNorm}`;
-
-    if (!teamMap.has(homeKey)) {
-      teamRows.push({
-        league_id: f.league,
-        season: '26', // Current season
-        canonical_name: f.home,
-        normalized_name: homeNorm,
-      });
-      teamMap.set(homeKey, homeNorm);
-    }
-    if (!teamMap.has(awayKey)) {
-      teamRows.push({
-        league_id: f.league,
-        season: '26',
-        canonical_name: f.away,
-        normalized_name: awayNorm,
-      });
-      teamMap.set(awayKey, awayNorm);
+    for (const raw of [f.home, f.away]) {
+      const norm = normalizeTeamName(raw);
+      const key = `${f.league}:${norm}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      teamRows.push({ league_id: f.league, season: '26', canonical_name: raw, normalized_name: norm });
     }
   }
+  const teams = await upsertChunks(sb, 'team_canonical', teamRows, 'league_id,normalized_name');
+  errors.push(...teams.errors);
 
-  let teamsCreated = 0;
-  if (teamRows.length > 0) {
-    const { data, error } = await sb
-      .from('team_canonical')
-      .upsert(teamRows, { onConflict: 'league_id,normalized_name', ignoreDuplicates: true })
-      .select('team_id,league_id,normalized_name');
+  const { map: teamMap, error: mapErr } = await loadTeamMap(sb, leagueIds);
+  if (mapErr) return { teamsCreated: teams.inserted.length, fixturesCreated: 0, checkpointsCreated: 0, errors: [...errors, `team map: ${mapErr}`] };
 
-    if (error) {
-      errors.push(`team_canonical upsert: ${error.message}`);
-      return { teamsCreated: 0, fixturesCreated: 0, checkpointsCreated: 0, errors };
-    }
-
-    teamsCreated = data?.length || 0;
-    for (const row of data || []) {
-      teamMap.set(`${row.league_id}:${row.normalized_name}`, row.team_id);
-    }
-  }
-
-  // Create fixtures + checkpoints
   const fixtureRows: Omit<Fixture, 'fixture_id' | 'created_at' | 'updated_at'>[] = [];
-
   for (const f of fixtures) {
-    const homeNorm = normalizeTeamName(f.home);
-    const awayNorm = normalizeTeamName(f.away);
-    const homeId = teamMap.get(`${f.league}:${homeNorm}`);
-    const awayId = teamMap.get(`${f.league}:${awayNorm}`);
-
-    if (!homeId || !awayId) {
-      errors.push(`Missing team_id for ${f.home} or ${f.away}`);
-      continue;
-    }
-
-       const matchRef = buildMatchRef(f.league, '26', homeId, awayId);
-    const kickoffUtc = parseTheSportsDBDateTime(f.date, f.time);
-
-    if (!kickoffUtc) {
-      errors.push(`Invalid date/time for ${f.home} vs ${f.away} (${f.date} ${f.time})`);
-      continue;
-    }
-
+    const homeId = teamMap.get(`${f.league}:${normalizeTeamName(f.home)}`);
+    const awayId = teamMap.get(`${f.league}:${normalizeTeamName(f.away)}`);
+    if (!homeId || !awayId) { errors.push(`missing team_id: ${f.home} v ${f.away}`); continue; }
+    if (homeId === awayId) continue;
+    const ko = parseTheSportsDBDateTimeSafe(f.date, f.time);
+    if (!ko) { errors.push(`bad datetime: ${f.home} v ${f.away} (${f.date} ${f.time})`); continue; }
     fixtureRows.push({
-      provider: 'thesportsdb',
-      provider_fixture_id: f.sourceId,
-      league_id: f.league,
-      season: '26',
-      home_team_id: homeId,
-      away_team_id: awayId,
-      match_ref: matchRef,
-      status: 'scheduled',
-      scheduled_kickoff_utc: kickoffUtc,
-      actual_kickoff_utc: null,
-      provider_updated_at: null,
-      source: 'thesportsdb',
+      provider: 'thesportsdb', provider_fixture_id: String(f.sourceId),
+      league_id: f.league, season: '26',
+      home_team_id: homeId, away_team_id: awayId,
+      match_ref: buildMatchRef(f.league, '26', homeId, awayId),
+      status: 'scheduled', scheduled_kickoff_utc: ko,
+      actual_kickoff_utc: null, provider_updated_at: null, source: 'thesportsdb',
     });
   }
+  const fx = await upsertChunks(sb, 'fixtures', fixtureRows, 'match_ref');
+  errors.push(...fx.errors);
 
-  let fixturesCreated = 0;
-  let checkpointsCreated = 0;
+  // Checkpoints ONLY for upcoming fixtures (including ones inserted on earlier runs)
+  const { data: upcoming, error: upErr } = await sb
+    .from('fixtures')
+    .select('fixture_id,scheduled_kickoff_utc')
+    .eq('provider', 'thesportsdb')
+    .gt('scheduled_kickoff_utc', new Date().toISOString());
+  if (upErr) return { teamsCreated: teams.inserted.length, fixturesCreated: fx.inserted.length, checkpointsCreated: 0, errors: [...errors, upErr.message] };
 
-  if (fixtureRows.length > 0) {
-    const { data, error } = await sb
-      .from('fixtures')
-      .upsert(fixtureRows, { onConflict: 'match_ref', ignoreDuplicates: true })
-      .select('fixture_id,match_ref,scheduled_kickoff_utc');
+  const cpRows: any[] = [];
+  for (const f of upcoming || []) cpRows.push(...buildCheckpoints(f.fixture_id, f.scheduled_kickoff_utc));
+  const cps = await upsertChunks(sb, 'checkpoints', cpRows, 'fixture_id,stage');
+  errors.push(...cps.errors);
 
-    if (error) {
-      errors.push(`fixtures upsert: ${error.message}`);
-      return { teamsCreated, fixturesCreated: 0, checkpointsCreated: 0, errors };
-    }
-
-    fixturesCreated = data?.length || 0;
-
-    const checkpointRows: Omit<Checkpoint, 'checkpoint_id' | 'attempts' | 'captured_at' | 'created_at' | 'updated_at'>[] = [];
-    for (const fx of data || []) {
-      const cps = buildCheckpoints(fx.fixture_id, fx.scheduled_kickoff_utc);
-      checkpointRows.push(...cps);
-    }
-
-    if (checkpointRows.length > 0) {
-      const { error: cpError } = await sb
-        .from('checkpoints')
-        .upsert(checkpointRows, { onConflict: 'fixture_id,stage', ignoreDuplicates: true });
-
-      if (cpError) {
-        errors.push(`checkpoints upsert: ${cpError.message}`);
-      } else {
-        checkpointsCreated = checkpointRows.length;
-      }
-    }
-  }
-
-  return { teamsCreated, fixturesCreated, checkpointsCreated, errors };
+  return { teamsCreated: teams.inserted.length, fixturesCreated: fx.inserted.length, checkpointsCreated: cps.inserted.length, errors };
 }
