@@ -15,6 +15,12 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
             <div className="flex-1 flex flex-col overflow-hidden">
               <TopBar />
               <main className="flex-1 overflow-y-auto">{children}</main>
+              <footer className="shrink-0 border-t border-[var(--line)] py-1.5 px-4 text-[10px] text-[var(--dim)] text-center">
+                Football data by{' '}
+                <a href="https://5dollarfootballapi.com" target="_blank" rel="noopener noreferrer" className="underline hover:text-[var(--tx)]">
+                  5DollarFootballAPI
+                </a>
+              </footer>
             </div>
           </div>
         </AuthGate>
