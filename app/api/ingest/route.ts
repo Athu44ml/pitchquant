@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { ingestCSVs, ingestTheSportsDB } from '@/lib/ingestion';
+import { ingestCSVs, ingestTheSportsDB, ingestLocalFixtures } from '@/lib/ingestion';
 
 export const maxDuration = 60;
 
@@ -12,15 +12,10 @@ async function run(req: Request) {
   const source = searchParams.get('source') || 'csv';
   const league = searchParams.get('league') || undefined;
 
-  if (source === 'csv') {
-    const r = await ingestCSVs(league);
-    return NextResponse.json({ source, league: league || 'all', ...r });
-  }
-  if (source === 'thesportsdb') {
-    const r = await ingestTheSportsDB();
-    return NextResponse.json({ source, ...r });
-  }
-  return NextResponse.json({ error: 'use ?source=csv or ?source=thesportsdb' }, { status: 400 });
+  if (source === 'csv') return NextResponse.json({ source, league: league || 'all', ...(await ingestCSVs(league)) });
+  if (source === 'fixtures') return NextResponse.json({ source, ...(await ingestLocalFixtures()) });
+  if (source === 'thesportsdb') return NextResponse.json({ source, ...(await ingestTheSportsDB()) });
+  return NextResponse.json({ error: 'use ?source=csv|fixtures|thesportsdb' }, { status: 400 });
 }
 
 export async function GET(req: Request) { return run(req); }
